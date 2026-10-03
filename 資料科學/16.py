@@ -1,4 +1,5 @@
 import csv
+import re
 import time
 from pathlib import Path
 from datetime import datetime
@@ -13,8 +14,6 @@ from selenium.common.exceptions import TimeoutException
 
 
 CSV_PATH = Path(__file__).resolve().parent / "agoda_result.csv"
-
-# 用飯店名稱當 key，避免重複寫入
 hotels = {}
 
 driver = webdriver.Chrome()
@@ -23,90 +22,40 @@ wait = WebDriverWait(driver, 30)
 stage = "開啟 Agoda"
 
 
-def is_visible(element):
-    try:
-        return element.is_displayed()
-    except Exception:
-        return False
+def find_first_city_suggestion(destination):
+    """找輸入框下方最上方的台中建議項目。"""
+    input_bottom = destination.rect["y"] + destination.rect["height"]
+    candidates = []
 
-
-def click_lodging_tab():
-    """明確選住宿，避免沿用到活動體驗模式。"""
-    matches = driver.find_elements(
-        By.XPATH,
-        "//*[normalize-space()='住宿']"
+    elements = driver.find_elements(
+        By.XPATH, "//*[contains(normalize-space(.), '台中')]"
     )
 
-    for element in matches:
-        if not is_visible(element):
-            continue
-
-        # 找到可點擊的父層；若找不到就點文字本身
-        target = driver.execute_script("""
-            let el = arguments[0];
-            while (el && el !== document.body) {
-                if (el.matches(
-                    'button, [role="tab"], [role="button"], a, [tabindex]'
-                )) {
-                    return el;
-                }
-                el = el.parentElement;
-            }
-            return arguments[0];
-        """, element)
-
+    for element in elements:
         try:
-            target.click()
-        except Exception:
-            driver.execute_script("arguments[0].click();", target)
-
-        time.sleep(1)
-        print("已點選住宿模式")
-        return True
-
-    return False
-
-
-def choose_taichung_city(destination_input):
-    """選台中市整座城市，排除市中心、行政區等地區建議。"""
-    selectors = [
-        '[role="option"]',
-        '[data-selenium*="autocomplete"]',
-        '[class*="autocomplete"]',
-        '[class*="Autocomplete"]',
-        "li",
-    ]
-
-    candidates = []
-    seen = set()
-
-    for selector in selectors:
-        for element in driver.find_elements(By.CSS_SELECTOR, selector):
-            if not is_visible(element):
+            if not element.is_displayed():
                 continue
 
             text = " ".join(element.text.split())
-            if not text or text in seen:
-                continue
-            seen.add(text)
-
-            # 排除「位於台中市市中心」及各行政區等地區選項
-            if "台中市" not in text:
-                continue
-            if any(word in text for word in [
-                "市中心", "地區", "西屯", "北區", "中區",
-                "南區", "東區", "逢甲", "區，"
-            ]):
+            if not text or len(text) > 80:
                 continue
 
-            candidates.append((len(text), element, text))
+            rect = element.rect
+            if rect["y"] < input_bottom - 5:
+                continue
 
-    # 較短的候選通常是單一建議項目，避免點到包含整個下拉清單的外層
-    candidates.sort(key=lambda item: item[0])
+            candidates.append((rect["y"], len(text), element, text))
+        except Exception:
+            continue
 
-    for _, element, text in candidates:
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: (item[0], item[1]))
+
+    for _, _, element, text in candidates:
         try:
-            target = driver.execute_script("""
+            clickable = driver.execute_script("""
                 let el = arguments[0];
                 while (el && el !== document.body) {
                     if (el.matches(
@@ -119,24 +68,11 @@ def choose_taichung_city(destination_input):
                 return arguments[0];
             """, element)
 
-            print("選取城市建議：", text)
-            try:
-                target.click()
-            except Exception:
-                driver.execute_script("arguments[0].click();", target)
-
-            return True
+            return clickable, text
         except Exception:
             continue
 
-    # 找不到候選時列出畫面上的建議，避免不小心選到地區
-    print("找不到可確認為整座城市的建議。畫面上的相關建議：")
-    for selector in selectors:
-        for element in driver.find_elements(By.CSS_SELECTOR, selector):
-            if is_visible(element) and "台中" in element.text:
-                print("-", " ".join(element.text.split()))
-
-    return False
+    return None
 
 
 def find_hotel_cards():
@@ -148,39 +84,26 @@ def find_hotel_cards():
         "[data-hotelid]",
     ]
 
-    found = []
-    seen_ids = set()
-
     for selector in selectors:
-        for card in driver.find_elements(By.CSS_SELECTOR, selector):
-            try:
-                if card.id not in seen_ids:
-                    seen_ids.add(card.id)
-                    found.append(card)
-            except Exception:
-                pass
-
-        if found:
-            return found
+        cards = driver.find_elements(By.CSS_SELECTOR, selector)
+        if cards:
+            return cards
 
     return []
 
 
-def extract_price_from_card(card):
-    price_selectors = [
-        ".hotel-price-container .soft-red",
-        ".hotel-price-container .price",
-        '[data-selenium="display-price"]',
-        '[data-selenium*="price"]',
-    ]
+def hotel_results_heading_visible():
+    try:
+        body_text = driver.find_element(By.TAG_NAME, "body").text
+        return bool(
+            re.search(r"位於\s*台中市的?\s*\d+\s*間住宿", body_text)
+        )
+    except Exception:
+        return False
 
-    for selector in price_selectors:
-        for element in card.find_elements(By.CSS_SELECTOR, selector):
-            text = " ".join(element.text.split())
-            if text:
-                return text
 
-    return ""
+def hotel_results_visible():
+    return hotel_results_heading_visible() or bool(find_hotel_cards())
 
 
 def collect_visible_hotels():
@@ -194,31 +117,50 @@ def collect_visible_hotels():
             if not visible:
                 continue
 
-            name_selectors = [
+            name = ""
+            for selector in [
                 ".hotel-name",
                 '[data-selenium="hotel-name"]',
                 "h3",
                 "h4",
-            ]
-
-            name = ""
-            for selector in name_selectors:
-                elements = card.find_elements(By.CSS_SELECTOR, selector)
+            ]:
                 name = next(
-                    (element.text.strip() for element in elements
-                     if element.text.strip()),
-                    ""
+                    (
+                        element.text.strip()
+                        for element in card.find_elements(
+                            By.CSS_SELECTOR, selector
+                        )
+                        if element.text.strip()
+                    ),
+                    "",
                 )
                 if name:
                     break
 
-            price = extract_price_from_card(card)
+            price = ""
+            for selector in [
+                ".hotel-price-container .soft-red",
+                ".hotel-price-container .price",
+                '[data-selenium="display-price"]',
+                '[data-selenium*="price"]',
+            ]:
+                price = next(
+                    (
+                        element.text.strip()
+                        for element in card.find_elements(
+                            By.CSS_SELECTOR, selector
+                        )
+                        if element.text.strip()
+                    ),
+                    "",
+                )
+                if price:
+                    break
 
             if name and price:
                 hotels[name] = [name, price]
 
         except Exception:
-            # 頁面滾動時卡片可能重新載入，略過該張再繼續
             continue
 
 
@@ -230,93 +172,115 @@ def save_csv():
             writer = csv.writer(file)
             writer.writerow(["飯店名稱", "特價"])
             writer.writerows(rows)
-        print(f"CSV 位置：{CSV_PATH}")
+        print("CSV 位置：", CSV_PATH)
 
     except PermissionError:
-        # 常見原因是 CSV 正在 Excel 中開啟
-        fallback_path = CSV_PATH.with_name(
+        new_path = CSV_PATH.with_name(
             f"agoda_result_{datetime.now():%Y%m%d_%H%M%S}.csv"
         )
-        with open(fallback_path, "w", newline="", encoding="utf-8-sig") as file:
+        with open(new_path, "w", newline="", encoding="utf-8-sig") as file:
             writer = csv.writer(file)
             writer.writerow(["飯店名稱", "特價"])
             writer.writerows(rows)
-        print("原 CSV 無法覆寫，可能正開在 Excel 中。")
-        print(f"改存至：{fallback_path}")
+        print("原 CSV 無法覆寫，改存：", new_path)
 
 
 try:
     stage = "開啟 Agoda"
     driver.get("https://www.agoda.com/zh-tw/")
 
-    # 先明確切到住宿模式
-    stage = "切換住宿模式"
-    if not click_lodging_tab():
-        print("找不到「住宿」分頁，先確認目前頁面上的住宿模式。")
-
-    # 輸入台中
-    stage = "輸入台中"
-    destination = wait.until(
-        EC.element_to_be_clickable(
-            (By.CSS_SELECTOR, 'input[data-selenium="textInput"]')
+    # 確認住宿分頁已選取
+    stage = "確認住宿分頁"
+    hotel_tab = wait.until(
+        EC.presence_of_element_located(
+            (By.CSS_SELECTOR, '[role="tab"][data-element-name="all-rooms-tab"]')
         )
     )
+
+    if hotel_tab.get_attribute("aria-selected") != "true":
+        hotel_tab.click()
+        wait.until(
+            lambda d: hotel_tab.get_attribute("aria-selected") == "true"
+        )
+
+    print("目前分頁：", hotel_tab.text.strip())
+
+    # 從住宿分頁找到住宿表單
+    stage = "定位住宿表單"
+    panel_id = hotel_tab.get_attribute("aria-controls")
+    if not panel_id:
+        raise RuntimeError("住宿分頁沒有 aria-controls，無法定位住宿表單。")
+
+    panel = wait.until(
+        EC.presence_of_element_located((By.ID, panel_id))
+    )
+
+    # 在住宿表單輸入台中
+    stage = "輸入台中"
+    destination = panel.find_element(
+        By.CSS_SELECTOR, 'input[data-selenium="textInput"]'
+    )
+    wait.until(lambda d: destination.is_displayed() and destination.is_enabled())
+
     destination.click()
     destination.send_keys(Keys.CONTROL, "a")
     destination.send_keys("台中")
 
-    # 選整座台中市，不選市中心或行政區
-    stage = "選擇台中市"
-    WebDriverWait(driver, 10).until(
-        lambda d: any(
-            element.is_displayed() and "台中" in element.text
-            for element in d.find_elements(
-                By.CSS_SELECTOR,
-                '[role="option"], li, [class*="autocomplete"], '
-                '[class*="Autocomplete"]'
-            )
-        )
+    # 等建議清單出現，實際點選畫面上的第一筆
+    stage = "選取第一筆城市建議"
+    city_result = WebDriverWait(driver, 20, poll_frequency=0.5).until(
+        lambda d: find_first_city_suggestion(destination)
     )
+    city_element, city_text = city_result
+    print("選取第一筆建議：", city_text)
+    driver.execute_script("arguments[0].click();", city_element)
+    time.sleep(0.5)
 
-    if not choose_taichung_city(destination):
-        raise RuntimeError(
-            "沒有找到可確認為整座台中市的建議，已停止以免選到行政區。"
-        )
+    # 確認仍在住宿分頁
+    if hotel_tab.get_attribute("aria-selected") != "true":
+        raise RuntimeError("選取城市後住宿分頁不再是目前選取的分頁。")
 
-    # 搜尋住宿
+    # 從住宿表單取得搜尋按鈕
     stage = "搜尋住宿"
-    search_button = wait.until(
-        lambda d: d.execute_script("""
-            const elements = [
-                ...document.querySelectorAll(
-                    'button, [role="button"], input[type="submit"]'
-                )
-            ];
-            return elements.find(element =>
-                element.getClientRects().length > 0 &&
-                (element.innerText || element.value || '').trim() === '搜出好價'
-            ) || null;
-        """)
+    search_button = panel.find_element(
+        By.CSS_SELECTOR, '[data-element-name="search-button"]'
     )
-    search_button.click()
+    wait.until(lambda d: search_button.is_enabled())
 
-    # 先辨認是不是又被導到活動搜尋，再等住宿卡片
-    stage = "等待住宿結果列表"
-    wait.until(
-        lambda d:
-            "/activities/" in d.current_url
-            or len(find_hotel_cards()) > 0
-            or "間住宿" in d.find_element(By.TAG_NAME, "body").text
-    )
+    # 記錄目前分頁，供搜尋後辨認新分頁
+    old_handles = set(driver.window_handles)
 
-    if "/activities/" in driver.current_url:
-        raise RuntimeError(
-            "仍進入活動搜尋頁。請確認住宿分頁有被選取，且搜尋按鈕屬於住宿表單。"
+    # 關閉可能出現的日期浮層，不會修改日期
+    driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+    time.sleep(0.3)
+
+    # 點搜尋按鈕
+    driver.execute_script("arguments[0].click();", search_button)
+
+    # 等待並切換到搜尋結果新分頁
+    stage = "切換搜尋結果分頁"
+    new_handle = WebDriverWait(driver, 30, poll_frequency=0.5).until(
+        lambda d: next(
+            (
+                handle
+                for handle in d.window_handles
+                if handle not in old_handles
+            ),
+            False,
         )
+    )
+    driver.switch_to.window(new_handle)
+    print("已切換到新分頁：", driver.current_url)
 
-    print("住宿結果網址：", driver.current_url)
+    # 在新分頁等待住宿標題或飯店卡片
+    stage = "等待飯店結果"
+    results_wait = WebDriverWait(driver, 90, poll_frequency=1)
+    results_wait.until(lambda d: hotel_results_visible())
 
-    # 模擬滑鼠滾動；新卡片連續多次沒有增加才停止
+    print("搜尋結果網址：", driver.current_url)
+    print("已偵測到住宿結果，開始擷取。")
+
+    # 滾動並擷取飯店資料
     stage = "滾動並擷取飯店資料"
     no_new_rounds = 0
 
@@ -326,17 +290,12 @@ try:
 
         ActionChains(driver).scroll_by_amount(0, 650).perform()
         time.sleep(1.5)
-
         collect_visible_hotels()
-        added = len(hotels) - old_count
 
+        added = len(hotels) - old_count
         print(f"滾動 {turn + 1} 次：新增 {added} 間，累計 {len(hotels)} 間")
 
-        if added == 0:
-            no_new_rounds += 1
-        else:
-            no_new_rounds = 0
-
+        no_new_rounds = no_new_rounds + 1 if added == 0 else 0
         if no_new_rounds >= 6:
             print("連續多次沒有新飯店，停止滾動。")
             break
@@ -351,7 +310,7 @@ except Exception as error:
 
 finally:
     save_csv()
-    print(f"飯店資料筆數：{len(hotels)}")
+    print("飯店資料筆數：", len(hotels))
 
     try:
         driver.quit()
