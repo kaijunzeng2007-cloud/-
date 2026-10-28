@@ -1,0 +1,158 @@
+import re
+import ssl
+import time
+import pandas as pd
+import requests
+import urllib3
+from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import Select, WebDriverWait
+from webdriver_manager.chrome import ChromeDriverManager
+
+# 1. 忽略 SSL 警告
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+ssl._create_default_https_context = ssl._create_unverified_context
+
+
+def clean_text(text):
+    if not text:
+        return ""
+    text = text.replace("\n", "").replace("\r", "").replace("\t", "").strip()
+    return re.sub(r"\s+", " ", text)
+
+
+print("正在啟動 Chrome 瀏覽器...")
+
+options = webdriver.ChromeOptions()
+options.add_argument("--ignore-certificate-errors")
+options.add_argument("--ignore-ssl-errors")
+options.add_argument("--start-maximized")
+options.add_argument(
+    "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    " (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+driver = webdriver.Chrome(
+    service=Service(ChromeDriverManager().install()), options=options
+)
+
+url = "https://hoopshype.com/salaries/players/"
+driver.get(url)
+
+try:
+    WebDriverWait(driver, 15).until(
+        EC.presence_of_element_located((By.TAG_NAME, "table"))
+    )
+    time.sleep(2)
+except Exception:
+    print("頁面載入逾時！")
+
+# 關鍵破解：尋找「每頁顯示筆數」選單並改為全部展現
+print("正在將表格顯示筆數調整為全部展現...")
+show_all_success = False
+
+# 嘗試方式 A：尋找網頁上的 <select> 選單 (例如 name="table_length" 或類別)
+try:
+    select_elements = driver.find_elements(By.TAG_NAME, "select")
+    for sel_el in select_elements:
+        select = Select(sel_el)
+        # 嘗試選擇最大的數值或 All
+        for option in select.options:
+            val = option.get_attribute("value") or option.text
+            if val in ["-1", "500", "All", "1000", "100"]:
+                select.select_by_value(val)
+                print(f"成功選取每頁顯示選項：{val}")
+                show_all_success = True
+                time.sleep(3)
+                break
+        if show_all_success:
+            break
+except Exception as e:
+    print(f"選單選擇提示: {e}")
+
+# 嘗試方式 B：如果沒有原生 <select>，改用 JS 強制刪除分頁限制並重繪
+if not show_all_success:
+    print("嘗試使用 JavaScript 解開表格資料列隱藏 (display: none)...")
+    driver.execute_script("""
+        // 將所有隱藏的 tr 列強制顯示
+        var hiddenRows = document.querySelectorAll('table tbody tr');
+        hiddenRows.forEach(function(row) {
+            row.style.display = '';
+        });
+    """)
+    time.sleep(2)
+
+# 抓取展開後的頁面原始碼
+soup = BeautifulSoup(driver.page_source, "html.parser")
+driver.quit()
+
+table = soup.find("table", class_="hh-salaries-ranking-table") or soup.find(
+    "table"
+)
+
+all_rows = []
+headers = []
+
+if table:
+    # 擷取表頭
+    thead = table.find("thead")
+    if thead:
+        headers = [
+            clean_text(th.get_text()) for th in thead.find_all(["th", "td"])
+        ]
+
+    # 擷取表格內容
+    tbody = table.find("tbody") or table
+    for tr in tbody.find_all("tr"):
+        cells = [clean_text(td.get_text()) for td in tr.find_all(["td", "th"])]
+        if cells and len(cells) >= 3 and cells[0] != "Rank":
+            all_rows.append(cells)
+
+print(f"\n最終解析完成！合計抓取到 {len(all_rows)} 位球員資料。")
+
+# --- 產出 1: 匯出全聯賽薪資表 all_play.csv ---
+if all_rows:
+    if not headers or len(headers) != len(all_rows[0]):
+        headers = [f"Col_{i+1}" for i in range(len(all_rows[0]))]
+
+    df = pd.DataFrame(all_rows, columns=headers)
+    df.to_csv("all_play.csv", index=False, encoding="utf-8-sig")
+    print("✅ 已成功儲存全聯盟薪資表：all_play.csv")
+
+# --- 產出 2: 抓取前 3 位高薪球員基本資料至 highest.csv ---
+if all_rows:
+    print("\n正在處理前 3 位高薪球員背號與詳細資料...")
+    highest_players = []
+    headers_req = {"User-Agent": options.arguments[-1].split("=")[-1]}
+
+    for row in all_rows[:3]:
+        player_name = row[1] if len(row) > 1 else ""
+        salary = row[2] if len(row) > 2 else ""
+        number = "N/A"
+
+        p_tag = soup.find("a", string=re.compile(re.escape(player_name), re.I))
+        if p_tag and p_tag.get("href"):
+            p_url = p_tag["href"]
+            try:
+                p_res = requests.get(p_url, headers=headers_req, verify=False)
+                p_soup = BeautifulSoup(p_res.text, "html.parser")
+                num_span = p_soup.find("span", class_="player-number") or p_soup.find(
+                    class_=re.compile("number", re.I)
+                )
+                if num_span:
+                    number = clean_text(num_span.get_text())
+            except Exception:
+                pass
+
+        highest_players.append(
+            {"Player": player_name, "Number": number, "Salary": salary}
+        )
+
+    highest_df = pd.DataFrame(highest_players)
+    highest_df.to_csv("highest.csv", index=False, encoding="utf-8-sig")
+    print("✅ 已成功儲存高薪球員資料：highest.csv")
+
+print("\n🎉 所有任務順利完成！")
