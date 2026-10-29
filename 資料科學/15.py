@@ -1,385 +1,536 @@
 
-import csv
 import os
+import csv
 import time
-from urllib.parse import parse_qs, quote, urlparse
 
 from selenium import webdriver
-from selenium.common.exceptions import TimeoutException, WebDriverException
-from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
+from selenium.common.exceptions import (
+    TimeoutException,
+    WebDriverException,
+    StaleElementReferenceException
+)
 
+# ======================================
+# 基本設定
+# ======================================
 KEYWORD = "xpath"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CSV_FILE = os.path.join(BASE_DIR, "xpath.csv")
+DEBUG_FILE = os.path.join(BASE_DIR, "google_debug.html")
+
 PROFILE = r"C:\selenium_xpath_profile"
-CSV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xpath.csv")
-SEARCH_URL = f"https://www.google.com/search?q={quote(KEYWORD)}&hl=zh-TW&gl=TW"
+
+MAX_PAGES = 10
+WAIT_SECONDS = 25
+MAX_SCROLLS = 35
+
+driver = None
+results = []
+seen = set()
+
+os.makedirs(PROFILE, exist_ok=True)
+
+# ======================================
+# Chrome 設定
+# ======================================
+options = webdriver.ChromeOptions()
+
+options.add_argument("--start-maximized")
+options.add_argument("--lang=zh-TW")
+options.add_argument(f"--user-data-dir={PROFILE}")
+
+# 隱藏自動化提示列（不保證所有版本有效）
+options.add_experimental_option(
+    "excludeSwitches", ["enable-automation"]
+)
+
+options.add_experimental_option(
+    "useAutomationExtension", False
+)
+
+# ======================================
+# 清理文字
+# ======================================
+def clean(text):
+    return " ".join((text or "").split()).strip()
 
 
-def text_clean(value):
-    return " ".join((value or "").split())
-
-
-# Google 驗證：人工完成後自動繼續
-def wait_captcha(driver):
-    def challenged(d):
-        return "/sorry/" in d.current_url or bool(
-            d.find_elements(By.ID, "captcha-form")
+# ======================================
+# 儲存 CSV
+# ======================================
+def save_csv():
+    with open(
+        CSV_FILE,
+        "w",
+        newline="",
+        encoding="utf-8-sig"
+    ) as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["標題", "網址"]
         )
 
-    if challenged(driver):
-        print("請在 Chrome 完成 Google 驗證，程式會自動繼續。")
-        WebDriverWait(driver, 600, poll_frequency=2).until(
-            lambda d: not challenged(d)
-        )
+        writer.writeheader()
+        writer.writerows(results)
 
 
-# 偵測 AI 摘要
-def ai_label(driver):
-    return driver.execute_script(r"""
-        const ok = e => e && e.getClientRects().length > 0;
-        const re = /AI\s*(摘要|Overview)/i;
-        const walker = document.createTreeWalker(
-            document.body, NodeFilter.SHOW_TEXT
-        );
-        let n;
-
-        while ((n = walker.nextNode())) {
-            const s = (n.nodeValue || '')
-                .replace(/\s+/g, ' ').trim();
-
-            if (s.length <= 35 && re.test(s) && ok(n.parentElement))
-                return n.parentElement;
-        }
-
-        return [...document.querySelectorAll('span,div,h2,h3,strong')]
-            .find(e => ok(e) && (e.innerText || '').length <= 35 &&
-                re.test(e.innerText || '')) || null;
-    """)
-
-
-# 取得 AI 摘要內容
-def ai_text(driver):
-    label = ai_label(driver)
-
-    if not label:
-        return ""
-
-    return driver.execute_script("""
-        let e = arguments[0], best = '';
-
-        for (let i = 0; e && i < 16; i++, e = e.parentElement) {
-            if (e === document.body ||
-                ['search', 'rso'].includes(e.id) ||
-                e.tagName === 'MAIN') break;
-
-            const s = (e.innerText || '').trim();
-            const count = e.querySelectorAll('a[href] h3').length;
-
-            if (count > 3) break;
-
-            if (s.length > 90 && s.length < 40000)
-                best = s;
-        }
-
-        return best;
-    """, label) or ""
-
-
-# 點擊 AI 摘要的「顯示更多」
-def expand_ai(driver):
-    label = ai_label(driver)
-
-    if not label:
-        return
-
-    button = driver.execute_script(r"""
-        const y0 = arguments[0].getBoundingClientRect().top + scrollY;
-        const re = /^(顯示更多|查看更多|Show more|Read more)\s*[⌄˅∨▼]?$/i;
-        const walker = document.createTreeWalker(
-            document.body, NodeFilter.SHOW_TEXT
-        );
-
-        const choices = [];
-        let n;
-
-        while ((n = walker.nextNode())) {
-            if (!re.test((n.nodeValue || '').replace(/\s+/g, ' ').trim()))
-                continue;
-
-            const e = n.parentElement.closest(
-                'button,[role="button"]'
-            ) || n.parentElement;
-
-            if (!e.getClientRects().length || e.closest('a[href]'))
-                continue;
-
-            const y = e.getBoundingClientRect().top + scrollY;
-
-            if (y >= y0 - 20 && y <= y0 + 2500)
-                choices.push({e, y});
-        }
-
-        choices.sort((a, b) => a.y - b.y);
-
-        return choices.length ? choices[0].e : null;
-    """, label)
-
-    if not button:
-        return
-
-    before = len(ai_text(driver))
-
-    driver.execute_script(
-        "arguments[0].scrollIntoView({block:'center'})", button
-    )
-
+# ======================================
+# 儲存除錯 HTML
+# ======================================
+def save_debug():
     try:
-        button.click()
+        with open(
+            DEBUG_FILE,
+            "w",
+            encoding="utf-8"
+        ) as f:
+            f.write(driver.page_source)
+
+        print("除錯檔案：", DEBUG_FILE)
+
     except WebDriverException:
-        driver.execute_script("arguments[0].click()", button)
-
-    try:
-        WebDriverWait(driver, 8).until(
-            lambda d: len(ai_text(d)) > before + 15
-        )
-    except TimeoutException:
         pass
 
 
-# 清理搜尋結果網址
-def clean_url(url):
-    parsed = urlparse(url or "")
+# ======================================
+# Google 驗證檢查
+# ======================================
+def is_verification():
+    try:
+        if "/sorry/" in driver.current_url.lower():
+            return True
 
-    if parsed.scheme not in ("http", "https"):
-        return ""
+        body = driver.find_element(
+            By.TAG_NAME, "body"
+        ).text.lower()
 
-    if parsed.hostname in (
-        "google.com", "www.google.com",
-        "google.com.tw", "www.google.com.tw"
-    ):
-        if parsed.path == "/url":
-            args = parse_qs(parsed.query)
-            return (args.get("q") or args.get("url") or [""])[0]
+        keywords = [
+            "unusual traffic",
+            "confirm you're not a robot",
+            "recaptcha",
+            "異常流量",
+            "確認你不是機器人",
+            "我不是機器人"
+        ]
 
-        return url if parsed.path == "/goto" else ""
+        return any(k in body for k in keywords)
 
-    return url.split("#", 1)[0]
-
-
-# 抓取第一頁搜尋結果
-def collect(driver, results):
-    headings = driver.find_elements(
-        By.CSS_SELECTOR, "#search h3, #rso h3, main h3"
-    )
-
-    for h in headings:
-        try:
-            title = text_clean(h.text)
-
-            link = h.find_element(
-                By.XPATH, "./ancestor::a[@href][1]"
-            )
-
-            url = clean_url(link.get_attribute("href"))
-
-            if not title or not url or url in results:
-                continue
-
-            summary = ""
-
-            try:
-                block = h.find_element(
-                    By.XPATH,
-                    "./ancestor::div[contains(@class,'MjjYud')][1]"
-                )
-
-                for e in block.find_elements(
-                    By.CSS_SELECTOR,
-                    ".VwiC3b, .yXK7lf, [data-sncf]"
-                ):
-                    s = text_clean(e.text)
-
-                    if s and s != title:
-                        summary = s[:1500]
-                        break
-
-            except WebDriverException:
-                pass
-
-            results[url] = (title, url, summary)
-
-        except WebDriverException:
-            continue
+    except WebDriverException:
+        return False
 
 
-# 自動捲動第一頁
-def scroll_first_page(driver, results):
-    same = 0
+def wait_verification():
+    if not is_verification():
+        return True
 
-    for _ in range(45):
-        wait_captcha(driver)
-        collect(driver, results)
-
-        before = driver.execute_script(
-            "return [scrollY, document.documentElement.scrollHeight]"
-        )
-
-        driver.execute_script("scrollBy(0, 700)")
-        time.sleep(0.55)
-
-        after = driver.execute_script(
-            "return [scrollY, document.documentElement.scrollHeight]"
-        )
-
-        same = same + 1 if before == after else 0
-
-        if same >= 3:
-            break
-
-    collect(driver, results)
-
-
-# 避免 Excel 將文字誤判為公式
-def safe(value):
-    value = str(value or "")
-
-    if value.lstrip().startswith(("=", "+", "-", "@")):
-        return "'" + value
-
-    return value
-
-
-# 主程式
-def main():
-    os.makedirs(PROFILE, exist_ok=True)
-
-    options = Options()
-    options.add_argument(f"--user-data-dir={PROFILE}")
-    options.add_argument("--lang=zh-TW")
-    options.add_argument("--start-maximized")
-
-    driver = None
-    results, ai, page_text = {}, "", ""
+    print("\nGoogle 要求驗證，請在 Chrome 完成。")
 
     try:
-        # 啟動 Chrome 並最大化
-        driver = webdriver.Chrome(options=options)
-        driver.maximize_window()
-
-        # 開啟 Google
-        driver.get("https://www.google.com/?hl=zh-TW")
-        wait_captcha(driver)
-
-        # 搜尋 xpath
-        try:
-            search = WebDriverWait(driver, 12).until(
-                lambda d: d.find_element(By.NAME, "q")
-            )
-
-            search.clear()
-            search.send_keys(KEYWORD, Keys.ENTER)
-
-        except (TimeoutException, WebDriverException):
-            driver.get(SEARCH_URL)
-
-        wait_captcha(driver)
-
-        # 等待搜尋結果載入
-        WebDriverWait(driver, 20).until(
-            lambda d: bool(d.find_elements(
-                By.CSS_SELECTOR, "#search h3, #rso h3, main h3"
-            )) or ai_label(d)
+        WebDriverWait(
+            driver,
+            180,
+            poll_frequency=2
+        ).until(
+            lambda d: not is_verification()
         )
 
-        # 等待 AI 摘要載入
+        print("驗證完成，自動繼續。")
+        return True
+
+    except TimeoutException:
+        print("驗證逾時。")
+        return False
+
+
+# ======================================
+# 等待搜尋結果
+# ======================================
+def has_results():
+    try:
+        return len(
+            driver.find_elements(By.CSS_SELECTOR, "h3")
+        ) > 0
+
+    except WebDriverException:
+        return False
+
+
+def wait_results():
+    try:
+        WebDriverWait(
+            driver,
+            WAIT_SECONDS
+        ).until(
+            lambda d: has_results() or is_verification()
+        )
+
+    except TimeoutException:
+        pass
+
+    if is_verification():
+        if not wait_verification():
+            return False
+
         try:
-            WebDriverWait(driver, 12).until(
-                lambda d: ai_label(d)
-            )
+            WebDriverWait(
+                driver,
+                WAIT_SECONDS
+            ).until(lambda d: has_results())
         except TimeoutException:
-            pass
+            return False
 
-        # 展開 AI 摘要並擷取完整可取得的文字
-        ai = ai_text(driver)
-        expand_ai(driver)
-        ai = max(ai, ai_text(driver), key=len)
+    return has_results()
 
-        # 捲動第一頁並抓取搜尋結果
-        scroll_first_page(driver, results)
 
-        # 再次確認 AI 摘要內容
-        ai = max(ai, ai_text(driver), key=len)
+# ======================================
+# 擷取所有 h3 標題與網址
+# ======================================
+def extract_results(page):
+    count = 0
 
-        # 備份第一頁可見文字
-        page_text = driver.execute_script("""
-            const area = document.querySelector('#search') ||
-                         document.querySelector('#rso') ||
-                         document.querySelector('main');
+    data = driver.execute_script("""
+        const output = [];
 
-            return area ? area.innerText : '';
+        document.querySelectorAll("h3").forEach(h3 => {
+            const title = (
+                h3.innerText ||
+                h3.textContent ||
+                ""
+            ).trim();
+
+            if (!title) return;
+
+            // 優先尋找包住 h3 的超連結
+            let link = h3.closest("a[href]");
+
+            // 備援：從父層向上尋找
+            if (!link) {
+                let parent = h3.parentElement;
+
+                for (let i = 0; i < 5 && parent; i++) {
+                    if (
+                        parent.tagName === "A" &&
+                        parent.href
+                    ) {
+                        link = parent;
+                        break;
+                    }
+
+                    parent = parent.parentElement;
+                }
+            }
+
+            output.push({
+                title: title,
+                url: link ? link.href : ""
+            });
+        });
+
+        return output;
+    """)
+
+    for item in data:
+        title = clean(item.get("title"))
+        url = (item.get("url") or "").strip()
+
+        if not title:
+            continue
+
+        # 同一標題與網址只存一次
+        key = (title, url)
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+
+        results.append({
+            "標題": title,
+            "網址": url
+        })
+
+        count += 1
+
+        print(f"\n第 {len(results)} 筆")
+        print("標題：", title)
+        print("網址：", url)
+
+    if count:
+        save_csv()
+
+    return count
+
+
+# ======================================
+# 自動捲動並擷取
+# ======================================
+def scroll_and_extract(page):
+    total = 0
+    unchanged = 0
+    previous_height = -1
+
+    for _ in range(MAX_SCROLLS):
+
+        if not wait_verification():
+            return total, False
+
+        total += extract_results(page)
+
+        driver.execute_script(
+            "window.scrollBy(0, 700);"
+        )
+
+        time.sleep(1)
+
+        height = driver.execute_script(
+            "return document.documentElement.scrollHeight;"
+        )
+
+        at_bottom = driver.execute_script("""
+            return (
+                window.scrollY + window.innerHeight
+                >= document.documentElement.scrollHeight - 30
+            );
         """)
 
-    except Exception as e:
-        print(f"執行錯誤：{e}")
+        if at_bottom and height == previous_height:
+            unchanged += 1
+        else:
+            unchanged = 0
 
-    finally:
-        if driver:
-            driver.quit()
+        if unchanged >= 3:
+            break
 
-    # 整理全部抓取資料
-    rows = []
+        previous_height = height
 
-    if ai:
-        rows.append(("AI 摘要", "Google AI 摘要", "", ai))
+    total += extract_results(page)
 
-    rows.extend(
-        ("搜尋結果", *item)
-        for item in results.values()
-    )
+    return total, True
 
-    if page_text:
-        rows.append((
-            "本頁文字備份",
-            "Google 第一頁可見文字",
-            "",
-            page_text
-        ))
 
-    if not rows:
-        print("沒有取得資料，保留原本的 xpath.csv。")
-        return
+# ======================================
+# 頁面辨識
+# ======================================
+def page_signature():
+    try:
+        return driver.execute_script("""
+            return Array.from(
+                document.querySelectorAll("h3")
+            ).slice(0, 5)
+             .map(e => e.innerText)
+             .join("|");
+        """)
 
-    # 儲存所有資料至 CSV
-    with open(
-        CSV_FILE, "w", newline="", encoding="utf-8-sig"
-    ) as f:
-        writer = csv.writer(f)
+    except WebDriverException:
+        return ""
 
-        writer.writerow([
-            "編號", "類型", "標題", "網址", "摘要或完整內容"
-        ])
 
-        for i, row in enumerate(rows, 1):
-            writer.writerow([i, *(safe(v) for v in row)])
+# ======================================
+# 點擊更多結果 / 下一頁
+# ======================================
+def click_more():
+    old_url = driver.current_url
+    old_signature = page_signature()
 
-    # 終端機詳細列印全部資料
+    selectors = [
+        (By.ID, "pnnext"),
+        (By.CSS_SELECTOR, "a[rel='next']"),
+        (By.XPATH, "//a[contains(., '更多結果')]"),
+        (By.XPATH, "//button[contains(., '更多結果')]"),
+        (By.XPATH, "//a[contains(., '下一頁')]"),
+        (By.XPATH, "//button[contains(., '下一頁')]"),
+        (By.XPATH, "//a[contains(@aria-label, 'Next')]"),
+        (
+            By.XPATH,
+            "//*[@role='button' and contains(., '更多結果')]"
+        )
+    ]
+
+    for by, selector in selectors:
+        buttons = driver.find_elements(by, selector)
+
+        for button in buttons:
+            try:
+                if not button.is_displayed():
+                    continue
+
+                driver.execute_script(
+                    "arguments[0].scrollIntoView({block:'center'});",
+                    button
+                )
+
+                time.sleep(0.5)
+                button.click()
+
+                try:
+                    WebDriverWait(
+                        driver,
+                        WAIT_SECONDS
+                    ).until(
+                        lambda d:
+                        d.current_url != old_url
+                        or page_signature() != old_signature
+                        or is_verification()
+                    )
+
+                except TimeoutException:
+                    pass
+
+                if not wait_verification():
+                    return False
+
+                if (
+                    driver.current_url != old_url
+                    or page_signature() != old_signature
+                ):
+                    return True
+
+            except (
+                WebDriverException,
+                StaleElementReferenceException
+            ):
+                continue
+
+    return False
+
+
+# ======================================
+# Google 自動搜尋
+# ======================================
+def search_google():
+
+    driver.get("https://www.google.com/?hl=zh-TW")
+
+    if not wait_verification():
+        return False
+
+    try:
+        search_box = WebDriverWait(
+            driver,
+            WAIT_SECONDS
+        ).until(
+            lambda d: d.find_element(By.NAME, "q")
+        )
+
+    except TimeoutException:
+        print("找不到 Google 搜尋欄。")
+        save_debug()
+        return False
+
+    search_box.click()
+    search_box.clear()
+    search_box.send_keys(KEYWORD)
+    search_box.send_keys(Keys.ENTER)
+
     print(f"搜尋關鍵字：{KEYWORD}")
 
-    for i, (kind, title, url, content) in enumerate(rows, 1):
-        print(f"\n第 {i} 筆（{kind}）")
-        print(f"標題：{title}")
+    try:
+        WebDriverWait(
+            driver,
+            WAIT_SECONDS
+        ).until(
+            lambda d:
+            "/search" in d.current_url
+            or is_verification()
+        )
 
-        if url:
-            print(f"網址：{url}")
+    except TimeoutException:
+        print("搜尋未成功。")
+        save_debug()
+        return False
 
-        print(f"內容：{content or '（未取得）'}")
+    if not wait_verification():
+        return False
 
-    print(f"\n第一頁搜尋結果：{len(results)} 筆")
-    print(f"全部儲存資料：{len(rows)} 筆")
-    print(f"CSV 已儲存：{CSV_FILE}")
+    if not wait_results():
+        print("搜尋結果未載入。")
+        save_debug()
+        return False
+
+    return True
 
 
-if __name__ == "__main__":
-    main()
+# ======================================
+# 主程式
+# ======================================
+try:
+    # 覆蓋舊 CSV
+    save_csv()
+
+    driver = webdriver.Chrome(options=options)
+
+    if search_google():
+
+        processed = set()
+
+        for page in range(1, MAX_PAGES + 1):
+
+            if not wait_verification():
+                break
+
+            if not wait_results():
+                print("搜尋結果載入失敗。")
+                save_debug()
+                break
+
+            signature = (
+                driver.current_url,
+                page_signature()
+            )
+
+            if signature in processed:
+                print("偵測到重複頁面。")
+                break
+
+            processed.add(signature)
+
+            print("\n" + "=" * 50)
+            print(f"第 {page} 頁搜尋結果")
+            print("=" * 50)
+
+            count, completed = scroll_and_extract(page)
+
+            print(f"\n本頁新增：{count} 筆")
+            print(f"累計結果：{len(results)} 筆")
+
+            save_csv()
+
+            if not completed:
+                break
+
+            if count == 0:
+                save_debug()
+
+            if page >= MAX_PAGES:
+                break
+
+            if not click_more():
+                print("\n沒有更多結果。")
+                break
+
+            time.sleep(2)
+
+except Exception as e:
+    print(f"\n錯誤：{type(e).__name__}: {e}")
+
+    if driver is not None:
+        save_debug()
+
+finally:
+    save_csv()
+
+    if driver is not None:
+        try:
+            driver.quit()
+        except WebDriverException:
+            pass
+
+    print("\n" + "=" * 50)
+    print(f"搜尋關鍵字：{KEYWORD}")
+    print(f"有效搜尋結果：{len(results)} 筆")
+    print(f"CSV 位置：{CSV_FILE}")
+    print("Chrome 已關閉")
+    print("=" * 50)
