@@ -12,7 +12,7 @@
 * **技術**：`Selenium`, `BeautifulSoup`, `Openpyxl`, `re`
 * **功能**：自動翻頁抓取台北週末票房前 20 名電影，並利用 `openpyxl` 產出具有自定義樣式、千分位數字格式與自動篩選功能的 `Taipei_movies.xlsx`。
 
-* **`8.py`（原檔名 `7.py`）：近期上映強片輪播爬蟲**
+* **`8.py`：近期上映強片輪播爬蟲**
 * **技術**：`Selenium`, `BeautifulSoup`, `re`
 * **功能**：模擬點擊網頁輪播按鈕（Next），抓取開眼電影網「近期上映強片」的上映時間與電影名稱，去除重複後匯出 `movies.csv`。
 
